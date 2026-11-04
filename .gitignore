@@ -1,0 +1,17 @@
+# 工作区内部数据（记忆、审计中间产物、页面源包）
+.workbuddy/
+audit-src/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 日志与临时文件
+*.log
+*.tmp

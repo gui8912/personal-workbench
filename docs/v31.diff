@@ -1,0 +1,349 @@
+--- v30_baseline/index.html
++++ v31_fixed/index.html
+@@ -3150,5 +3150,11 @@
+ const resName = r => (r && IRESULT[r] !== undefined) ? IRESULT[r] : T('resNone');
+ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
++// modified: [v31-P2] 同毫秒批量创建改用 crypto.randomUUID（去掉连字符，保持 id 可作属性值）；旧环境自动降级
++const uid = () => {
++  try {
++    if (window.crypto && typeof window.crypto.randomUUID === 'function') return 'i' + window.crypto.randomUUID().replace(/-/g, ''); // modified
++  } catch (e) {}
++  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7) + Math.random().toString(36).slice(2, 7); // modified
++}; // modified
+ 
+ /* ---------- 个人事项：分类标签（内置键 + 用户自定义名称，一条事项可挂多个标签） ---------- */
+@@ -3478,20 +3484,55 @@
+ });
+ 
++// modified: [v31-P0] 解析/归一化失败时先把原始串隔离留档，绝不静默清空；最多保留最近 3 份
++function quarantineRaw(raw, why) {
++  if (!raw) return;
++  try {
++    const stamp = Date.now();
++    const item = JSON.stringify({ at: stamp, why: why, raw: raw }); // modified
++    localStorage.setItem(KEY + '_corrupt_latest', item); // modified
++    localStorage.setItem(KEY + '_corrupt_' + stamp, item); // modified
++    const keys = []; // modified
++    for (let i = 0; i < localStorage.length; i++) { // modified
++      const k = localStorage.key(i); // modified
++      if (k && k.indexOf(KEY + '_corrupt_') === 0 && k !== KEY + '_corrupt_latest') keys.push(k); // modified
++    }
++    keys.sort().slice(0, Math.max(0, keys.length - 3)).forEach(k => { try { localStorage.removeItem(k); } catch (_) {} }); // modified
++  } catch (_) {}
++}
+ function load() {
++  let raw = null;
+   try {
+-    const raw = localStorage.getItem(KEY);
++    raw = localStorage.getItem(KEY);
+     if (!raw) { S = blank(); S.meta.sample = false; save(); return; }
+     const d = JSON.parse(raw);
++    if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('bad shape'); // modified
+     S = Object.assign(blank(), d);
+-    S.meta = Object.assign(blank().meta, d.meta || {});
++    S.meta = Object.assign(blank().meta, (d.meta && typeof d.meta === 'object') ? d.meta : {}); // modified
+     ['tasks','notes','projects','inspects','schedules','personal','study'].forEach(k => { if (!Array.isArray(S[k])) S[k] = []; });
+-    normalize();
++    try { normalize(); } // modified
++    catch (ne) { // modified
++      quarantineRaw(raw, 'normalize: ' + (ne && ne.message)); // modified
++      try { console.warn('[load] normalize failed; raw data kept as-is', ne); } catch (_) {} // modified
++    }
+   } catch (e) {
++    quarantineRaw(raw, 'parse: ' + (e && e.message)); // modified
+     S = blank(); S.meta.sample = false;
+     toast(T('tLoadFail'), true);
++    try { console.warn('[load] read failed; original data quarantined', e); } catch (_) {} // modified
+   }
+ }
+ /* 数据兼容：补齐字段、清理指向已删项目的悬空引用 */
+ function normalize() {
++  // modified: [v31-P1] 云端/手工导入的脏数据可能含 null 或非对象元素，先剔除再取 id，避免整页白屏
++  ['tasks','notes','projects','inspects','schedules','personal','study'].forEach(k => { // modified
++    S[k] = (Array.isArray(S[k]) ? S[k] : []).filter(x => x && typeof x === 'object' && !Array.isArray(x)); // modified
++  }); // modified
++  // modified: [v31-P1] 非法日期串（云端手改/旧备份）会让 dayDiff 得 NaN、排序与提醒错位；只兜非身份字段
++  // modified: 日程 date 参与业务键、学习 date 参与去重，二者不动，避免清空后误删数据
++  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/; // modified
++  const cleanD = v => (typeof v === 'string' && DATE_RE.test(v)) ? v : ''; // modified
++  S.tasks.forEach(x => { if ('due' in x) x.due = cleanD(x.due); }); // modified
++  S.personal.forEach(x => { if ('due' in x) x.due = cleanD(x.due); }); // modified
++  S.inspects.forEach(x => { ['date','recheck'].forEach(f => { if (f in x) x[f] = cleanD(x[f]); }); }); // modified
+   const ids = new Set(S.projects.map(p => p.id));
+   /* 【v30】身份与版本戳统一前置：后面的「自愈去重」要靠 updatedAt 决定留哪一条。
+@@ -3578,5 +3619,5 @@
+     });
+     const keep = new Set(best.values());
+-    S.study = S.study.filter(x => x && x.date && keep.get(x.date) === x);
++    S.study = S.study.filter(x => x && x.date && keep.has(x)); // modified
+     S.study.forEach(x => {
+       STU_DIMS.forEach(k => { x[k] = Math.min(5, Math.max(0, Number(x[k]) || 0)); });
+@@ -3604,5 +3645,10 @@
+   const write = () => {
+     try { S._savedAt = Date.now(); localStorage.setItem(KEY, JSON.stringify(S)); }
+-    catch (e) { toast(T('tSaveFail'), true); }
++    catch (e) {
++      // modified: [v31-P2] 区分配额/隐私模式，明确告知"内存态还在、先导出备份"
++      const quota = e && (e.name === 'QuotaExceededError' || e.code === 22); // modified
++      toast(quota ? (LANG === 'en' ? 'Storage full: export a backup first; data is still in memory' : '本机存储已满：请先导出备份再清理，数据暂未丢失') : T('tSaveFail'), true); // modified
++      try { console.warn('[save] localStorage write failed', e); } catch (_) {} // modified
++    }
+   };
+   if (instant) { clearTimeout(saveTimer); write(); return; }
+@@ -3616,7 +3662,23 @@
+     const raw = localStorage.getItem(KEY); if (!raw) return;
+     const savedAt = Number(JSON.parse(raw)._savedAt) || 0;
+-    if (savedAt > (S._savedAt || 0) + 800) { load(); render(); }
++    if (savedAt > (S._savedAt || 0) + 800) { load(); try { window.__SYNC_RESIG && window.__SYNC_RESIG(); } catch (_) {} render(); } // modified
+   } catch (e) {}
+ });
++// modified: [v31-N1] StorageEvent：另一标签页写入后即时同步，不必等切回本标签；输入/弹层期间不打断
++let __crossTabTimer = 0; // modified
++window.addEventListener('storage', e => { // modified
++  if (!e || e.key !== KEY || !S || e.newValue == null || document.hidden) return; // modified
++  if (document.querySelector('.mask')) return; // modified
++  const ae = document.activeElement; // modified
++  if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName || '')) return; // modified
++  try { // modified
++    const savedAt = Number(JSON.parse(e.newValue)._savedAt) || 0; // modified
++    if (savedAt <= (S._savedAt || 0) + 800) return; // modified
++  } catch (_) { return; } // modified
++  clearTimeout(__crossTabTimer); // modified
++  __crossTabTimer = setTimeout(() => { // modified
++    try { load(); window.__SYNC_RESIG && window.__SYNC_RESIG(); render(); } catch (_) {} // modified
++  }, 400); // modified
++}); // modified
+ /* 【v30】记录总数把日程 / 个人事项 / 学习打卡也算进去：页脚「共 N 条记录」是用户判断
+    「云端到底有没有把我全部内容拉回来」的唯一数字，旧口径少算了三张表。 */
+@@ -4174,5 +4236,5 @@
+         <span class="pill ${PRIO[k.prio].c}">${PRIO[k.prio].n}</span>
+         ${k.cat ? `<span class="pill gray">${catName(k.cat)}</span>` : ''}
+-        <span class="pill ${od?'red':(k.done?'gray':'cyan')}">${k.done ? T('doneAt', k.doneAt?clock(k.doneAt):'') : human(k.due)}</span>
++        <span class="pill ${od?'red':(k.done?'gray':'cyan')}">${k.done ? esc(T('doneAt', k.doneAt?clock(k.doneAt):'')) : esc(human(k.due))}</span> <!-- // modified -->
+         ${pn ? `<button class="pill proj-link" data-act="filter-proj" data-id="${k.pid}" title="${T('filterByProj')}">${I.proj}${esc(pn)}</button>` : ''}
+         ${k.rolls ? `<span class="pill warn">${T('rollsPill', k.rolls)}</span>` : ''}
+@@ -4194,5 +4256,5 @@
+     return `<div class="dgroup">
+       <div class="dgroup-h">
+-        <span class="dg-d">${d ? human(d) : T('noDue')}</span>
++        <span class="dg-d">${d ? esc(human(d)) : T('noDue')}</span> <!-- // modified -->
+         ${d ? `<span class="dg-x">${d.replace(/-/g,'/')} · ${wd}</span>` : ''}
+         <span class="dg-n">${T('groupCount', ks.length)}</span>
+@@ -4644,5 +4706,5 @@
+         <span class="pill ${PRIO[k.prio].c}">${PRIO[k.prio].n}</span>
+         ${pcatNames(k.cat).map(n => `<span class="pill gray">${esc(n)}</span>`).join('')}
+-        <span class="pill ${od?'red':(k.done?'gray':'cyan')}">${k.done ? T('pDoneAt', k.doneAt?clock(k.doneAt):'') : human(k.due)}</span>
++        <span class="pill ${od?'red':(k.done?'gray':'cyan')}">${k.done ? esc(T('pDoneAt', k.doneAt?clock(k.doneAt):'')) : esc(human(k.due))}</span> <!-- // modified -->
+         ${k.rolls ? `<span class="pill warn">${T('rollsPill', k.rolls)}</span>` : ''}
+       </div>
+@@ -4723,5 +4785,5 @@
+     <div class="form" style="margin-bottom:10px">
+       <div class="f" style="flex:0 0 130px"><label>${T('pLblPrio')}</label><select id="pe_prio">${Object.entries(PRIO).map(([v,p])=>`<option value="${v}"${Number(k.prio)===Number(v)?' selected':''}>${p.n}</option>`).join('')}</select></div>
+-      <div class="f" style="flex:1 1 150px;max-width:190px"><label>${T('pLblDue')}</label><input type="date" id="pe_due" value="${k.due||''}"></div>
++      <div class="f" style="flex:1 1 150px;max-width:190px"><label>${T('pLblDue')}</label><input type="date" id="pe_due" value="${esc(k.due||'')}"></div> <!-- // modified -->
+     </div>
+     <div class="f" style="margin-bottom:12px"><label>${T('pLblCat')}</label>${pcatPicker('pe_cat', k.cat)}</div>
+@@ -4752,5 +4814,5 @@
+   if (n < 0) return `<span class="pill rel past">${T('relPast', -n)}</span>`;
+   if (n <= 7) return `<span class="pill rel">${T('relIn', n)}</span>`;
+-  return `<span class="pill gray">${d.slice(5).replace('-', '/')}</span>`;
++  return `<span class="pill gray">${esc(String(d).slice(5).replace('-', '/'))}</span>`; // modified
+ }
+ function schedRow(s) {
+@@ -4893,5 +4955,5 @@
+     <div class="f" style="margin-bottom:10px"><label>${T('sLblTitle')}</label><input type="text" id="s_title" value="${esc(d.title||'')}" maxlength="120" placeholder="${T('phSched')}"></div>
+     <div class="form" style="margin-bottom:10px">
+-      <div class="f" style="flex:1 1 140px"><label>${T('sLblDate')}</label><input type="date" id="s_date" value="${d.date||TODAY()}"></div>
++      <div class="f" style="flex:1 1 140px"><label>${T('sLblDate')}</label><input type="date" id="s_date" value="${esc(d.date||TODAY())}"></div> <!-- // modified -->
+       ${x ? '' : `<div class="f" style="flex:1 1 140px"><label>${T('sLblUntil')}</label><input type="date" id="s_until" value=""></div>`}
+       <label class="ckl" style="align-self:flex-end;padding-bottom:8px"><input type="checkbox" id="s_allday" ${d.allday?'checked':''}>${T('sAllday')}</label>
+@@ -4899,6 +4961,6 @@
+     ${x ? '' : `<p style="margin:-2px 0 12px;font-size:12px">${T('sUntilHint')}</p>`}
+     <div class="form" style="margin-bottom:10px">
+-      <div class="f" style="flex:1 1 120px"><label>${T('sLblTime')}</label><input type="time" id="s_time" value="${d.time||''}"></div>
+-      <div class="f" style="flex:1 1 120px"><label>${T('sLblEnd')}</label><input type="time" id="s_end" value="${d.end||''}"></div>
++      <div class="f" style="flex:1 1 120px"><label>${T('sLblTime')}</label><input type="time" id="s_time" value="${esc(d.time||'')}"></div> <!-- // modified -->
++      <div class="f" style="flex:1 1 120px"><label>${T('sLblEnd')}</label><input type="time" id="s_end" value="${esc(d.end||'')}"></div> <!-- // modified -->
+       <div class="f grow"><label>${T('sLblCat')}</label><select id="s_cat">${SCATKEYS.map(c=>`<option value="${c}"${d.cat===c?' selected':''}>${SCAT[c].n}</option>`).join('')}</select></div>
+     </div>
+@@ -5407,5 +5469,5 @@
+       <div class="form" style="margin-bottom:10px">
+         <div class="f f-due"><label>${T('stuLblDate')}</label><input type="date" id="sDate" value="${esc(d)}" max="${TODAY()}" required></div>
+-        <div class="f f-w150"><label>${T('stuLblMin')}</label><input type="number" id="sMin" min="0" max="1440" step="5" value="${rec ? rec.mins : ''}" placeholder="60"></div>
++        <div class="f f-w150"><label>${T('stuLblMin')}</label><input type="number" id="sMin" min="0" max="1440" step="5" value="${esc(rec ? rec.mins : '')}" placeholder="60"></div> <!-- // modified -->
+         <div class="f f-prio"><label>${T('stuLblScore')}</label><select id="sScore">
+           ${[0,1,2,3,4,5].map(n => `<option value="${n}"${(rec ? rec.score : 0) === n ? ' selected' : ''}>${n || '—'}</option>`).join('')}
+@@ -5507,6 +5569,6 @@
+         </div>
+         <div style="display:flex;gap:6px;flex:0 0 auto">
+-          <button class="btn btn-sm" data-act="stu-load" data-d="${x.date}">${T('stuLoad')}</button>
+-          <button class="btn btn-sm btn-danger" data-act="stu-del" data-d="${x.date}">${T('stuDel')}</button>
++          <button class="btn btn-sm" data-act="stu-load" data-d="${esc(x.date)}">${T('stuLoad')}</button> <!-- // modified -->
++          <button class="btn btn-sm btn-danger" data-act="stu-del" data-d="${esc(x.date)}">${T('stuDel')}</button> <!-- // modified -->
+         </div>
+       </div>`).join('')}</div></div>`;
+@@ -5700,5 +5762,5 @@
+         <button class="pt-chk" data-act="toggle" data-id="${k.id}" title="${T('ttComplete')}">${I.check}</button>
+         <span class="pt-n">${esc(k.title)}</span>
+-        <span class="pt-d${od?' od':''}">${human(k.due)}</span></div>`;
++        <span class="pt-d${od?' od':''}">${esc(human(k.due))}</span></div>`; // modified
+     }).join('')}${more > 0 ? `<button class="pt-more" data-act="filter-proj" data-id="${p.id}">${T('ptMore', more)}</button>` : ''}</div>`
+     : `<div class="pt-done">${I.ok}<span>${T('ptAllDone', g.total)}</span></div>`}
+@@ -5897,12 +5959,16 @@
+       const data = JSON.parse(String(fr.result));
+       const looksOk = data && typeof data === 'object' &&
+-        ['tasks', 'personal', 'schedules', 'notes', 'projects', 'inspects'].some(k => Array.isArray(data[k]));
++        ['tasks', 'personal', 'schedules', 'notes', 'projects', 'inspects', 'study'].some(k => Array.isArray(data[k])); // modified
+       if (!looksOk) { toast(T('bkImportFail'), true); return; }
+-      const tk = { tombSched: S.tombSched, tombTask: S.tombTask, tombProj: S.tombProj, tombNote: S.tombNote, tombIns: S.tombIns, tombPers: S.tombPers };
++      // modified: [v31-P1] 补 tombStudy；导入后补 meta/数组校验并走 normalize，旧备份缺字段不再白屏
++      const tk = { tombSched: S.tombSched, tombTask: S.tombTask, tombProj: S.tombProj, tombNote: S.tombNote, tombIns: S.tombIns, tombPers: S.tombPers, tombStudy: S.tombStudy }; // modified
+       S = Object.assign(blank(), data);
++      S.meta = Object.assign(blank().meta, (data.meta && typeof data.meta === 'object') ? data.meta : {}); // modified
++      ['tasks','notes','projects','inspects','schedules','personal','study'].forEach(k => { if (!Array.isArray(S[k])) S[k] = []; }); // modified
+       /* 本地未推送的删除墓碑并入（时间取最新），避免刚删的条目被云端旧数据"复活" */
+-      ['tombSched','tombTask','tombProj','tombNote','tombIns','tombPers'].forEach(k => {
++      ['tombSched','tombTask','tombProj','tombNote','tombIns','tombPers','tombStudy'].forEach(k => { // modified
+         S[k] = Object.assign({}, S[k] || {}, tk[k] || {});
+       });
++      try { normalize(); } catch (ne) { try { console.warn('[import] normalize', ne); } catch (_) {} } // modified
+       save(true); render();
+       toast(T('bkImported', total()));
+@@ -5912,5 +5978,19 @@
+   fr.readAsText(file);
+ }
++// modified: [v31-N2] 读取最近一份隔离备份，供「数据说明」页下载自救
++function corruptBackup() {
++  try {
++    const raw = localStorage.getItem(KEY + '_corrupt_latest'); // modified
++    if (!raw) return null; // modified
++    const o = JSON.parse(raw); // modified
++    return (o && typeof o.raw === 'string' && o.raw) ? o : null; // modified
++  } catch (e) { return null; } // modified
++}
+ function vBackup() {
++  // modified: [v31-N2] 检测到隔离备份时给一条可见、可下载的恢复通道
++  const cb = corruptBackup(); // modified
++  const cbHtml = !cb ? '' : `<div class="card"><div class="card-h">${I.alert}<h2>${LANG === 'en' ? 'Corrupted data backup' : '检测到损坏数据备份'}</h2></div> <!-- // modified -->
++    <div class="card-b"><p style="color:var(--warn);font-size:13px;line-height:1.8">${LANG === 'en' ? 'The last load failed. The original data was preserved; download it before deciding whether to restore.' : '上次读取本地数据失败，原始内容已自动留档（不会被自动覆盖）。建议先下载留存，检查后再决定是否需要恢复。'}</p> <!-- // modified -->
++    <button class="btn" data-act="bk-corrupt-dl">${I.down}${LANG === 'en' ? 'Download backup' : '下载损坏备份'}</button></div></div>`; // modified
+   const diagHtml = !DIAG
+     ? `<div class="diag-note">${T('diagDesc')}</div>`
+@@ -5953,5 +6033,6 @@
+   + `<div class="card"><div class="card-h">${I.shield}<h2>${T('diagTitle')}</h2>
+       <div class="sp"><button class="btn btn-sm" data-act="diag-run">${I.search}${T('diagBtn')}</button></div></div>
+-      <div class="card-b">${diagHtml}</div></div>`;
++      <div class="card-b">${diagHtml}</div></div>`
++  + cbHtml; // modified
+ }
+ 
+@@ -6424,4 +6505,10 @@
+     case 'bk-import': { const bf = $('bkFile'); if (bf) bf.click(); else toast(T('tNeedFile'), true); return; }
+     case 'diag-run': { runCloudDiag(); return; }
++    case 'bk-corrupt-dl': { // modified: [v31-N2] 下载隔离的原始损坏数据
++      const cb = corruptBackup(); // modified
++      if (!cb) { toast(T('bkImportFail'), true); return; } // modified
++      downloadText('涨潮归_损坏数据备份_' + new Date(cb.at || Date.now()).toISOString().slice(0, 10) + '.json', cb.raw, 'application/json;charset=utf-8'); // modified
++      return; // modified
++    }
+ 
+     case 'wipe': {
+@@ -6431,5 +6518,6 @@
+       tombItems('tombTask', S.tasks); tombItems('tombProj', S.projects);
+       tombItems('tombNote', S.notes); tombItems('tombIns', S.inspects); tombItems('tombPers', S.personal);
+-      const tk = { tombSched: S.tombSched, tombTask: S.tombTask, tombProj: S.tombProj, tombNote: S.tombNote, tombIns: S.tombIns, tombPers: S.tombPers };
++      tombItems('tombStudy', S.study); // modified: [v31-P1] 清空时学习打卡也要登记墓碑，否则云端旧行会复活
++      const tk = { tombSched: S.tombSched, tombTask: S.tombTask, tombProj: S.tombProj, tombNote: S.tombNote, tombIns: S.tombIns, tombPers: S.tombPers, tombStudy: S.tombStudy }; // modified
+       exitBatch('t'); exitBatch('s'); exitBatch('n'); exitBatch('p'); exitBatch('i');
+       S = blank(); Object.assign(S, tk); S.meta.sample = false; save(true); ui.view = 'tasks'; render(); toast(T('tWiped'));
+@@ -6450,5 +6538,5 @@
+         ${Object.entries(PRIO).map(([v,p]) => `<option value="${v}"${Number(k.prio)===Number(v)?' selected':''}>${p.n}${LANG==='en'?` (${p.s})`:`（${p.s}）`}</option>`).join('')}
+       </select></div>
+-      <div class="f grow"><label>${T('lblDue')}</label><input type="date" id="et_due" value="${k.due || ''}"></div>
++      <div class="f grow"><label>${T('lblDue')}</label><input type="date" id="et_due" value="${esc(k.due || '')}"></div> <!-- // modified -->
+     </div>
+     <div class="form" style="margin-bottom:11px">
+@@ -6539,6 +6627,6 @@
+     </div>
+     <div class="form" style="margin-bottom:10px">
+-      <div class="f grow"><label>${T('lblInsDate')}</label><input type="date" id="ei_date" value="${x.date || ''}"></div>
+-      <div class="f grow"><label>${T('lblRecheck')}</label><input type="date" id="ei_recheck" value="${x.recheck || ''}"></div>
++      <div class="f grow"><label>${T('lblInsDate')}</label><input type="date" id="ei_date" value="${esc(x.date || '')}"></div> <!-- // modified -->
++      <div class="f grow"><label>${T('lblRecheck')}</label><input type="date" id="ei_recheck" value="${esc(x.recheck || '')}"></div> <!-- // modified -->
+     </div>
+     <div class="form" style="margin-bottom:10px">
+@@ -6698,6 +6786,6 @@
+   const customDates = s.range === 'custom'
+     ? `<div class="form" style="margin-top:10px">
+-        <div class="f grow"><label>${T('searchStart')}</label><input type="date" id="sStart" value="${s.start||''}"></div>
+-        <div class="f grow"><label>${T('searchEnd')}</label><input type="date" id="sEnd" value="${s.end||''}"></div>
++        <div class="f grow"><label>${T('searchStart')}</label><input type="date" id="sStart" value="${esc(s.start||'')}"></div> <!-- // modified -->
++        <div class="f grow"><label>${T('searchEnd')}</label><input type="date" id="sEnd" value="${esc(s.end||'')}"></div> <!-- // modified -->
+       </div>` : '';
+   const form = `<div class="card"><div class="card-h">${I.search}<h2>${T('searchHead')}</h2>
+@@ -7598,4 +7686,5 @@
+   var tmap = {};
+   var timer = null;
++  var deferTimer = 0; // modified: [v31-P1] 输入/弹层期间合并结果的延后重绘计时器
+ 
+   /* ---------- 基础工具 ---------- */
+@@ -7619,5 +7708,9 @@
+     (function page() {
+       if (guard++ > MAXP) { cb(all); return; }
+-      db.query({ databaseId: dbId, pageSize: PAGE, startCursor: cursor }).then(function (r) {
++      // modified: [v31-P1] SDK 同步抛错会打断整条启动链，后续 6 张表将永不再拉取
++      let pr; // modified
++      try { pr = db.query({ databaseId: dbId, pageSize: PAGE, startCursor: cursor }); } // modified
++      catch (err) { cb(null); return; } // modified
++      Promise.resolve(pr).then(function (r) { // modified
+         var rs = (r && r.results) || [];
+         all = all.concat(rs);
+@@ -7647,7 +7740,9 @@
+   /* 云端行 → 本地对象 */
+   function rowOf(cfg, row) {
+-    var lid = gv(row, '本地ID') || '';
++    // modified: [v31-P1] 云端「本地ID」列可被手工编辑，直接写进 data-id 等属性会造成属性注入；入口白名单清洗
++    var lid = String(gv(row, '本地ID') || '').replace(/[^A-Za-z0-9_\-]/g, '').slice(0, 64); // modified
++    var rid = recId(row); // modified
+     var x = cfg.rowToItem(row, gv);
+-    x.id = lid || ('leg_' + recId(row));
++    x.id = lid || ('leg_' + String(rid).replace(/[^A-Za-z0-9_\-]/g, '')); // modified
+     x._lid = lid;
+     x.updatedAt = Number(gv(row, '更新时间')) || 0;
+@@ -7659,5 +7754,5 @@
+     var p = cfg.itemToProps(x);
+     p['本地ID'] = { text: x.id };
+-    p['更新时间'] = { number: x.updatedAt || Date.now() };
++    p['更新时间'] = { number: Number(x.updatedAt) || Date.now() }; // modified
+     p['已删除'] = { checkbox: false };
+     return p;
+@@ -7769,5 +7864,10 @@
+     var after = safeSnap(cfg);
+     if (t) t.sig = after;                /* 先认账：拉下来的内容不再当成新改动推回去 */
+-    if (before !== after) { save(); render(); }
++    if (before !== after) { // modified
++      save(); // modified
++      // modified: [v31-P1] 正在输入/弹层打开时不整页重绘（会失焦丢字），数据已合并，空闲后补一次重绘
++      if (visible()) render(); // modified
++      else { clearTimeout(deferTimer); deferTimer = setTimeout(function () { try { if (visible()) render(); } catch (_) {} }, 900); } // modified
++    }
+     if (needPush) { var tt = tmap[cfg.dbId]; if (tt) tt.dirty = true; }
+   }
+@@ -7855,4 +7955,5 @@
+       } catch (e) {
+         try { console.warn('[sync] push ' + cfg.dbId, e); } catch (_) {}
++        finished = true; // modified: [v31-P2] 异常分支封口，迟到的异步回调不得再改写 t.sig 吞掉待推送改动
+         t.pushing = false;
+         retry();
+@@ -7949,7 +8050,9 @@
+     },
+     pullAll: function () { T.forEach(function (t) { pull(t); }); },
+-    pushAll: function () { T.forEach(function (t) { t.dirty = true; }); schedule(200); }
++    pushAll: function () { T.forEach(function (t) { t.dirty = true; }); schedule(200); },
++    resig: function () { T.forEach(function (t) { t.sig = safeSnap(t.cfg); }); } // modified: [v31-P2] 跨标签载入后重新认账，避免把别人的改动误判成本地改动全表回推
+   };
+ })();
++if (CloudSync) { try { window.__SYNC_RESIG = CloudSync.resig; } catch (e) {} } // modified
+ 
+ /* ---- 任务表（云端列：标题/优先级/截止日期/是否完成/所属项目/创建日期；分类·汇报·顺延为本地字段） ---- */
